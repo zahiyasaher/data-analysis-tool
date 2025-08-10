@@ -393,7 +393,7 @@ def main():
                             st.session_state.pending_code = msg["code"]
                             st.session_state.pending_should_plot = bool(msg.get("should_plot", False))
                             st.session_state.pending_query = msg.get("query", "")
-                            st.experimental_rerun()
+                            st.rerun()
 
         # If a file is loaded, allow code generation and edit-before-run
         if file:
@@ -476,13 +476,13 @@ def main():
                     st.session_state.pending_code = None
                     st.session_state.pending_should_plot = False
                     st.session_state.pending_query = ""
-                    st.experimental_rerun()
+                    st.rerun()
                 elif cancel_clicked:
                     st.session_state.pending_code = None
                     st.session_state.pending_should_plot = False
                     st.session_state.pending_query = ""
-                    st.experimental_rerun()
-
+                    st.rerun()
+ 
             # Standard chat input -> generate code only (do not auto-execute)
             if user_q := st.chat_input("Ask about your data…"):
                 st.session_state.messages.append({"role": "user", "content": user_q})
@@ -492,7 +492,7 @@ def main():
                 st.session_state.pending_code = code
                 st.session_state.pending_should_plot = should_plot_flag
                 st.session_state.pending_query = user_q
-                st.experimental_rerun()
+                st.rerun()
 
     with st.sidebar:
         st.subheader("🧠 Agent Memory")
