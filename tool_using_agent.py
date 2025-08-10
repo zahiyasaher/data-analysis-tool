@@ -162,15 +162,6 @@ def CodeGenerationAgent(query: str, df: pd.DataFrame):
     tool_used = "PlotCodeGeneratorTool" if should_plot else "CodeWritingTool"
     prompt = PlotCodeGeneratorTool(df.columns.tolist(), query) if should_plot else CodeWritingTool(df.columns.tolist(), query)
 
-    # Incorporate recent user messages for conversational context (last 3 user prompts)
-    try:
-        previous_user_messages = [m["content"] for m in st.session_state.get("messages", []) if m.get("role") == "user"][-3:]
-    except Exception:
-        previous_user_messages = []
-    if previous_user_messages:
-        context_block = "\n".join(f"- {m}" for m in previous_user_messages)
-        prompt = f"{prompt}\n\nPrevious related questions for context:\n{context_block}"
-
     messages = [
         {"role": "system", "content": "detailed thinking off. You are a Python data-analysis expert..."},
         {"role": "user", "content": prompt}
@@ -340,22 +331,6 @@ def main():
     if "model_name" not in st.session_state:
         st.session_state.model_name = DEFAULT_MODEL
 
-    # Initialize interactive execution state
-    if "pending_code" not in st.session_state:
-        st.session_state.pending_code = ""
-    if "pending_query" not in st.session_state:
-        st.session_state.pending_query = ""
-    if "pending_should_plot" not in st.session_state:
-        st.session_state.pending_should_plot = False
-    if "has_executed" not in st.session_state:
-        st.session_state.has_executed = False
-    if "last_explanation" not in st.session_state:
-        st.session_state.last_explanation = ""
-    if "last_plot_idx" not in st.session_state:
-        st.session_state.last_plot_idx = None
-    if "last_result_display" not in st.session_state:
-        st.session_state.last_result_display = ""
-
     left, right = st.columns([3, 7])
 
     with left:
@@ -393,89 +368,62 @@ def main():
         if file:
             if user_q := st.chat_input("Ask about your data…"):
                 st.session_state.messages.append({"role": "user", "content": user_q})
-                with st.spinner("Drafting code …"):
-                    code, should_plot_flag, _ = CodeGenerationAgent(user_q, st.session_state.df)
-                # Prepare editable code before execution
-                st.session_state.pending_code = code or "result = df.head()"
-                st.session_state.pending_query = user_q
-                st.session_state.pending_should_plot = should_plot_flag
-                st.session_state.has_executed = False
-                st.session_state.last_explanation = ""
-                st.session_state.last_plot_idx = None
-                st.session_state.last_result_display = ""
-                st.session_state["code_editor"] = st.session_state.pending_code
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": "I generated code for your request. You can review and edit it below, then click Run."
-                })
-                st.rerun()
-
-        # Side-by-side interactive panel for code, plot/result, and explanation
-        if file and st.session_state.get("pending_code"):
-            st.divider()
-            st.subheader("Review, edit, and run")
-            run_clicked = False
-            col_code, col_result, col_explain = st.columns([4, 5, 4])
-
-            with col_code:
-                st.markdown("**Code**")
-                st.text_area(
-                    "Generated code",
-                    value=st.session_state.get("code_editor", st.session_state.pending_code),
-                    key="code_editor",
-                    height=360,
-                )
-                if not st.session_state.get("has_executed", False):
-                    run_clicked = st.button("Run code", type="primary", key="run_code_btn")
-                else:
-                    run_clicked = st.button("Rerun with changes", type="primary", key="rerun_code_btn")
-
-            if run_clicked:
-                st.session_state.pending_code = st.session_state.code_editor
-                with st.spinner("Executing …"):
-                    result_obj = ExecutionAgent(st.session_state.pending_code, st.session_state.df, st.session_state.pending_should_plot)
-                    raw_thinking, reasoning_txt = ReasoningAgent(st.session_state.pending_query, result_obj)
-                reasoning_txt = (reasoning_txt or "").replace("`", "")
-
-                # Prepare result display state
+                with st.spinner("Working …"):
+                    code, should_plot_flag, code_thinking = CodeGenerationAgent(user_q, st.session_state.df)
+                    result_obj = ExecutionAgent(code, st.session_state.df, should_plot_flag)
+                    raw_thinking, reasoning_txt = ReasoningAgent(user_q, result_obj)
+                    reasoning_txt = reasoning_txt.replace("`", "")
                 is_plot = isinstance(result_obj, (plt.Figure, plt.Axes))
-                st.session_state.last_plot_idx = None
+                plot_idx = None
                 if is_plot:
                     fig = result_obj.figure if isinstance(result_obj, plt.Axes) else result_obj
                     st.session_state.plots.append(fig)
-                    st.session_state.last_plot_idx = len(st.session_state.plots) - 1
-                    st.session_state.last_result_display = ""
+                    plot_idx = len(st.session_state.plots) - 1
+                    header = "Here is the visualization you requested:"
+                    result_display = ""  # Plot will be rendered separately
                 elif isinstance(result_obj, pd.Series):
-                    st.session_state.last_result_display = f"```\n{result_obj.to_string()}\n```"
+                    header = "Here is the result:"
+                    result_display = f"```{result_obj.to_string()}```"
                 elif isinstance(result_obj, pd.DataFrame):
-                    st.session_state.last_result_display = f"```\n{result_obj.to_string(index=False)}\n```"
+                    header = f"Result: {len(result_obj)} rows"
+                    result_display = f"```{result_obj.to_string(index=False)}```"
                 elif isinstance(result_obj, list):
-                    st.session_state.last_result_display = f"```\n{', '.join(str(item) for item in result_obj)}\n```"
+                    header = "Here is the list you requested:"
+                    result_display = f"```{', '.join(str(item) for item in result_obj)}```"
                 else:
-                    st.session_state.last_result_display = f"```\n{str(result_obj)}\n```"
+                    header = "Here is the result:"
+                    result_display = f"```{str(result_obj)}```"
 
-                st.session_state.last_explanation = reasoning_txt
-                st.session_state.has_executed = True
+                # Optional reasoning section
+                thinking_html = ""
+                if raw_thinking:
+                    thinking_html = (
+                        '<details class="thinking">'
+                        '<summary>🧠 Reasoning</summary>'
+                        f'<pre>{raw_thinking}</pre>'
+                        '</details>'
+                    )
 
-                # Log an assistant message to maintain conversation context
+                # Optional explanation/code sections
+                explanation_html = reasoning_txt or ""
+                code_html = (
+                    '<details class="code">'
+                    '<summary>View code</summary>'
+                    '<pre><code class="language-python">'
+                    f'{code}'
+                    '</code></pre>'
+                    '</details>'
+                )
+
+                # Final assistant message
+                assistant_msg = f"{thinking_html}<h4>{header}</h4>\n\n{explanation_html}\n\n{code_html}\n\n{result_display}"
+
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": "Executed code. See side-by-side results below."
+                    "content": assistant_msg,
+                    "plot_index": plot_idx
                 })
                 st.rerun()
-
-            with col_result:
-                st.markdown("**Plot / Result**")
-                if st.session_state.get("has_executed"):
-                    if st.session_state.last_plot_idx is not None and 0 <= st.session_state.last_plot_idx < len(st.session_state.plots):
-                        st.pyplot(st.session_state.plots[st.session_state.last_plot_idx], use_container_width=True)
-                    elif st.session_state.last_result_display:
-                        st.markdown(st.session_state.last_result_display)
-
-            with col_explain:
-                st.markdown("**Explanation**")
-                if st.session_state.get("has_executed"):
-                    st.markdown(st.session_state.last_explanation)
 
     with st.sidebar:
         st.subheader("🧠 Agent Memory")
