@@ -157,14 +157,32 @@ def CodeWritingTool(cols: List[str], query: str) -> str:
     """
 
 # === CodeGenerationAgent ==============================================
-def CodeGenerationAgent(query: str, df: pd.DataFrame):
+def CodeGenerationAgent(query: str, df: pd.DataFrame, chat_context: List[Dict[str, str]] | None = None):
     should_plot = QueryUnderstandingTool(query)
     tool_used = "PlotCodeGeneratorTool" if should_plot else "CodeWritingTool"
-    prompt = PlotCodeGeneratorTool(df.columns.tolist(), query) if should_plot else CodeWritingTool(df.columns.tolist(), query)
+    base_prompt = PlotCodeGeneratorTool(df.columns.tolist(), query) if should_plot else CodeWritingTool(df.columns.tolist(), query)
+
+    context_text = ""
+    if chat_context:
+        recent_ctx = chat_context[-6:]
+        ctx_lines: List[str] = []
+        for entry in recent_ctx:
+            etype = entry.get("type")
+            content = entry.get("content", "")
+            if etype == "user":
+                ctx_lines.append(f"User: {content}")
+            elif etype == "code":
+                ctx_lines.append("Previous code:\n" + content[:2000])
+            elif etype == "explanation":
+                ctx_lines.append("Previous explanation:\n" + content[:800])
+        if ctx_lines:
+            context_text = "Context for refinement (use to improve the next answer):\n" + "\n\n".join(ctx_lines)
+
+    user_prompt = (context_text + "\n\n" + base_prompt) if context_text else base_prompt
 
     messages = [
         {"role": "system", "content": "detailed thinking off. You are a Python data-analysis expert..."},
-        {"role": "user", "content": prompt}
+        {"role": "user", "content": user_prompt}
     ]
 
     try:
@@ -330,6 +348,10 @@ def main():
         st.session_state.memory = AgentMemory()
     if "model_name" not in st.session_state:
         st.session_state.model_name = DEFAULT_MODEL
+    if "chat_context" not in st.session_state:
+        st.session_state.chat_context: List[Dict[str, str]] = []
+    if "pending" not in st.session_state:
+        st.session_state.pending = None
 
     left, right = st.columns([3, 7])
 
@@ -359,79 +381,99 @@ def main():
         with chat_container:
             for msg in st.session_state.messages:
                 with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"], unsafe_allow_html=True)
-                    if msg.get("plot_index") is not None:
-                        idx = msg["plot_index"]
-                        if 0 <= idx < len(st.session_state.plots):
-                            st.pyplot(st.session_state.plots[idx], use_container_width=False)
+                    # Render side-by-side columns for assistant results
+                    if msg["role"] == "assistant" and (msg.get("code") or msg.get("explanation") or msg.get("result_display")):
+                        col_code, col_mid, col_expl = st.columns([4, 3, 5])
+                        with col_code:
+                            if msg.get("code"):
+                                st.subheader("Code")
+                                st.code(msg["code"], language="python")
+                        with col_mid:
+                            st.subheader("Result")
+                            idx = msg.get("plot_index")
+                            if idx is not None and 0 <= idx < len(st.session_state.plots):
+                                st.pyplot(st.session_state.plots[idx], use_container_width=False)
+                            elif msg.get("result_display"):
+                                st.markdown(msg["result_display"], unsafe_allow_html=True)
+                        with col_expl:
+                            if msg.get("explanation"):
+                                st.subheader("Explanation")
+                                st.markdown(msg["explanation"], unsafe_allow_html=True)
+                    else:
+                        st.markdown(msg.get("content", ""), unsafe_allow_html=True)
 
         if file:
+            # Chat input: generate code, but do not execute until user edits/confirms
             if user_q := st.chat_input("Ask about your data…"):
                 st.session_state.messages.append({"role": "user", "content": user_q})
-                with st.spinner("Working …"):
-                    code, should_plot_flag, code_thinking = CodeGenerationAgent(user_q, st.session_state.df)
-                    result_obj = ExecutionAgent(code, st.session_state.df, should_plot_flag)
-                    raw_thinking, reasoning_txt = ReasoningAgent(user_q, result_obj)
-                    reasoning_txt = reasoning_txt.replace("`", "")
-                is_plot = isinstance(result_obj, (plt.Figure, plt.Axes))
-                plot_idx = None
-                if is_plot:
-                    fig = result_obj.figure if isinstance(result_obj, plt.Axes) else result_obj
-                    st.session_state.plots.append(fig)
-                    plot_idx = len(st.session_state.plots) - 1
-                    header = "Here is the visualization you requested:"
-                    result_display = ""  # Plot will be rendered separately
-                elif isinstance(result_obj, pd.Series):
-                    header = "Here is the result:"
-                    result_display = f"```
+                st.session_state.chat_context.append({"type": "user", "content": user_q})
+                with st.spinner("Generating code …"):
+                    code, should_plot_flag, _ = CodeGenerationAgent(user_q, st.session_state.df, chat_context=st.session_state.chat_context)
+                st.session_state.pending = {
+                    "query": user_q,
+                    "code": code or "result = df.describe()",
+                    "should_plot": should_plot_flag,
+                }
+                st.rerun()
+
+            # If there is pending code, allow editing and running
+            if st.session_state.pending is not None:
+                st.markdown("---")
+                st.subheader("Review and edit the code, then run")
+                st.session_state.pending["code"] = st.text_area(
+                    "Generated code (editable)",
+                    value=st.session_state.pending.get("code", ""),
+                    key="code_editor",
+                    height=300,
+                )
+                run_col, rerun_col, _ = st.columns([2, 3, 5])
+                run_clicked = run_col.button("Run code")
+                rerun_clicked = rerun_col.button("Rerun with changes")
+                if run_clicked or rerun_clicked:
+                    code_to_run = st.session_state.pending.get("code", "result = df.describe()")
+                    with st.spinner("Executing …"):
+                        result_obj = ExecutionAgent(code_to_run, st.session_state.df, st.session_state.pending.get("should_plot", False))
+                        raw_thinking, reasoning_txt = ReasoningAgent(st.session_state.pending.get("query", ""), result_obj)
+                        reasoning_txt = (reasoning_txt or "").replace("`", "")
+                    is_plot = isinstance(result_obj, (plt.Figure, plt.Axes))
+                    plot_idx = None
+                    result_display = ""
+                    if is_plot:
+                        fig = result_obj.figure if isinstance(result_obj, plt.Axes) else result_obj
+                        st.session_state.plots.append(fig)
+                        plot_idx = len(st.session_state.plots) - 1
+                    elif isinstance(result_obj, pd.Series):
+                        result_display = f"```
 {result_obj.to_string()}
 ```"
-                elif isinstance(result_obj, pd.DataFrame):
-                    header = f"Result: {len(result_obj)} rows"
-                    result_display = f"```
+                    elif isinstance(result_obj, pd.DataFrame):
+                        result_display = f"```
 {result_obj.to_string(index=False)}
 ```"
-                elif isinstance(result_obj, list):
-                    header = "Here is the list you requested:"
-                    result_display = f"```
+                    elif isinstance(result_obj, list):
+                        result_display = f"```
 {', '.join(str(item) for item in result_obj)}
 ```"
-                else:
-                    header = "Here is the result:"
-                    result_display = f"```
+                    else:
+                        result_display = f"```
 {str(result_obj)}
 ```"
 
-                # Optional reasoning section
-                thinking_html = ""
-                if raw_thinking:
-                    thinking_html = (
-                        '<details class="thinking">'
-                        '<summary>🧠 Reasoning</summary>'
-                        f'<pre>{raw_thinking}</pre>'
-                        '</details>'
-                    )
+                    # Append assistant message with side-by-side data
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "code": code_to_run,
+                        "explanation": reasoning_txt,
+                        "plot_index": plot_idx,
+                        "result_display": result_display,
+                    })
 
-                # Optional explanation/code sections
-                explanation_html = reasoning_txt or ""
-                code_html = (
-                    '<details class="code">'
-                    '<summary>View code</summary>'
-                    '<pre><code class="language-python">'
-                    f'{code}'
-                    '</code></pre>'
-                    '</details>'
-                )
+                    # Update conversation context for refinement
+                    st.session_state.chat_context.append({"type": "code", "content": code_to_run})
+                    if reasoning_txt:
+                        st.session_state.chat_context.append({"type": "explanation", "content": reasoning_txt})
 
-                # Final assistant message
-                assistant_msg = f"{thinking_html}<h4>{header}</h4>\n\n{explanation_html}\n\n{code_html}\n\n{result_display}"
-
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": assistant_msg,
-                    "plot_index": plot_idx
-                })
-                st.rerun()
+                    st.rerun()
 
     with st.sidebar:
         st.subheader("🧠 Agent Memory")
