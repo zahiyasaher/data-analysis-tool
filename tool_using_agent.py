@@ -58,20 +58,74 @@ client = OpenAI(
     api_key=api_key
 )
 
+# Model configuration with fallback
+DEFAULT_MODEL = os.environ.get("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
+FALLBACK_MODEL = os.environ.get("NVIDIA_FALLBACK_MODEL", "mistralai/mixtral-8x7b-instruct")
+
+
+def _should_try_fallback(exc: Exception) -> bool:
+    text = str(exc)
+    return ("404" in text) or ("Not Found" in text) or ("Function id" in text)
+
+
+def create_chat_completion(messages: List[Dict[str, Any]], temperature: float = 0.2, max_tokens: int = 1024, stream: bool = False):
+    """Try the configured model; on 404/Not Found, try the fallback model.
+    Returns (response, used_model). Raises the last exception if all fail.
+    """
+    models_to_try: List[str] = []
+    if DEFAULT_MODEL:
+        models_to_try.append(DEFAULT_MODEL)
+    if FALLBACK_MODEL and FALLBACK_MODEL not in models_to_try:
+        models_to_try.append(FALLBACK_MODEL)
+
+    last_exc: Exception | None = None
+    for model_name in models_to_try:
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=stream,
+            )
+            return resp, model_name
+        except Exception as exc:  # broad: SDK raises various subclasses across versions
+            logging.error(f"Chat completion failed for model '{model_name}': {exc}")
+            last_exc = exc
+            # Only continue to fallback for specific not-found style errors
+            if _should_try_fallback(exc):
+                continue
+            else:
+                break
+    # If we reach here, all attempts failed
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No model configured for chat completion")
+
 # ------------------  QueryUnderstandingTool ---------------------------
 def QueryUnderstandingTool(query: str) -> bool:
     messages = [
         {"role": "system", "content": "detailed thinking off. You are an assistant that determines if a query is requesting a data visualization. Respond with only 'true' if the query is asking for a plot, chart, graph, or any visual representation of data. Otherwise, respond with 'false'."},
         {"role": "user", "content": query}
     ]
-    response = client.chat.completions.create(
-        model="nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        messages=messages,
-        temperature=0.1,
-        max_tokens=5
-    )
-    intent_response = response.choices[0].message.content.strip().lower()
-    return intent_response == "true"
+    try:
+        response, used_model = create_chat_completion(
+            messages=messages,
+            temperature=0.1,
+            max_tokens=5,
+            stream=False,
+        )
+        # track model in session, if available
+        try:
+            st.session_state["model_name"] = used_model
+        except Exception:
+            pass
+        intent_response = response.choices[0].message.content.strip().lower()
+        return intent_response == "true"
+    except Exception as exc:
+        logging.warning(f"QueryUnderstandingTool failed; using heuristic. Error: {exc}")
+        # Heuristic fallback if model is unavailable
+        return bool(re.search(r"\b(plot|chart|graph|visual|scatter|bar|line|histogram|pie)\b", query, re.IGNORECASE))
 
 # ------------------  PlotCodeGeneratorTool ---------------------------
 def PlotCodeGeneratorTool(cols: List[str], query: str) -> str:
@@ -113,14 +167,22 @@ def CodeGenerationAgent(query: str, df: pd.DataFrame):
         {"role": "user", "content": prompt}
     ]
 
-    response = client.chat.completions.create(
-        model="nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        messages=messages,
-        temperature=0.2,
-        max_tokens=1024
-    )
-    full_response = response.choices[0].message.content
-    code = extract_first_code_block(full_response)
+    try:
+        response, used_model = create_chat_completion(
+            messages=messages,
+            temperature=0.2,
+            max_tokens=1024,
+            stream=False,
+        )
+        try:
+            st.session_state["model_name"] = used_model
+        except Exception:
+            pass
+        full_response = response.choices[0].message.content
+        code = extract_first_code_block(full_response)
+    except Exception as exc:
+        logging.error(f"CodeGenerationAgent failed; falling back to df.describe(). Error: {exc}")
+        code = "result = df.describe()"
     st.session_state.memory.add(query, tool_used, code, "(Pending execution)")
     return code, should_plot, ""
 
@@ -173,16 +235,24 @@ def ReasoningAgent(query: str, result: Any):
     prompt = ReasoningCurator(query, result)
     is_error = isinstance(result, str) and result.startswith("Error executing code")
     is_plot = isinstance(result, (plt.Figure, plt.Axes))
-    response = client.chat.completions.create(
-        model="nvidia/llama-3.1-nemotron-ultra-253b-v1",
-        messages=[
-            {"role": "system", "content": "detailed thinking on. You are an insightful data analyst."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2,
-        max_tokens=1024,
-        stream=True
-    )
+    try:
+        response, used_model = create_chat_completion(
+            messages=[
+                {"role": "system", "content": "detailed thinking on. You are an insightful data analyst."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1024,
+            stream=True,
+        )
+        try:
+            st.session_state["model_name"] = used_model
+        except Exception:
+            pass
+    except Exception as exc:
+        logging.error(f"ReasoningAgent failed: {exc}")
+        return "", "I generated the result but could not produce an explanation due to a model error."
+
     thinking_placeholder = st.empty()
     full_response = ""
     thinking_content = ""
@@ -223,15 +293,19 @@ def DataFrameSummaryTool(df: pd.DataFrame) -> str:
 def DataInsightAgent(df: pd.DataFrame) -> str:
     prompt = DataFrameSummaryTool(df)
     try:
-        response = client.chat.completions.create(
-            model="nvidia/llama-3.1-nemotron-ultra-253b-v1",
+        response, used_model = create_chat_completion(
             messages=[
                 {"role": "system", "content": "detailed thinking off. You are a data analyst providing brief, focused insights."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=512
+            max_tokens=512,
+            stream=False,
         )
+        try:
+            st.session_state["model_name"] = used_model
+        except Exception:
+            pass
         return response.choices[0].message.content
     except Exception as exc:
         return f"Error generating dataset insights: {exc}"
@@ -254,12 +328,14 @@ def main():
         st.session_state.plots = []
     if "memory" not in st.session_state:
         st.session_state.memory = AgentMemory()
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = DEFAULT_MODEL
 
     left, right = st.columns([3, 7])
 
     with left:
         st.header("Data Analysis Agent")
-        st.markdown("<medium>Powered by NVIDIA Llama-3.1-Nemotron-Ultra-253B-v1</medium>", unsafe_allow_html=True)
+        st.markdown(f"<medium>Powered by {st.session_state.model_name}</medium>", unsafe_allow_html=True)
         file = st.file_uploader("Choose CSV", type=["csv"])
         if file:
             if ("df" not in st.session_state) or (st.session_state.get("current_file") != file.name):
@@ -307,16 +383,24 @@ def main():
                     result_display = ""  # Plot will be rendered separately
                 elif isinstance(result_obj, pd.Series):
                     header = "Here is the result:"
-                    result_display = f"```\n{result_obj.to_string()}\n```"
+                    result_display = f"```
+{result_obj.to_string()}
+```"
                 elif isinstance(result_obj, pd.DataFrame):
                     header = f"Result: {len(result_obj)} rows"
-                    result_display = f"```\n{result_obj.to_string(index=False)}\n```"
+                    result_display = f"```
+{result_obj.to_string(index=False)}
+```"
                 elif isinstance(result_obj, list):
                     header = "Here is the list you requested:"
-                    result_display = f"```\n{', '.join(str(item) for item in result_obj)}\n```"
+                    result_display = f"```
+{', '.join(str(item) for item in result_obj)}
+```"
                 else:
                     header = "Here is the result:"
-                    result_display = f"```\n{str(result_obj)}\n```"
+                    result_display = f"```
+{str(result_obj)}
+```"
 
                 # Optional reasoning section
                 thinking_html = ""
